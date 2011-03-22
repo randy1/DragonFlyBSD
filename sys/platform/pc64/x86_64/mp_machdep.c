@@ -65,6 +65,7 @@
 
 #include <machine/md_var.h>		/* setidt() */
 #include <machine_base/icu/icu.h>	/* IPIs */
+#include <machine_base/apic/ioapic_abi.h>
 #include <machine/intr_machdep.h>	/* IPIs */
 
 #define FIXUP_EXTRA_APIC_INTS	8	/* additional entries we may create */
@@ -189,9 +190,18 @@ struct mptable_pci_int {
 	int		mpci_dev;
 	int		mpci_pin;
 
-	int		mpci_ioapic;
+	int		mpci_ioapic_idx;
 	int		mpci_ioapic_pin;
 	TAILQ_ENTRY(mptable_pci_int) mpci_link;
+};
+
+struct mptable_ioapic {
+	int		mio_idx;
+	int		mio_apic_id;
+	uint32_t	mio_addr;
+	int		mio_gsi_base;
+	int		mio_npin;
+	TAILQ_ENTRY(mptable_ioapic) mio_link;
 };
 
 typedef	int	(*mptable_iter_func)(void *, const void *, int);
@@ -323,7 +333,6 @@ static void	mptable_fix(void);
 #endif
 static int	mptable_map(struct mptable_pos *);
 static void	mptable_unmap(struct mptable_pos *);
-static void	mptable_imcr(struct mptable_pos *);
 static void	mptable_bus_info_alloc(const mpcth_t,
 		    struct mptable_bus_info *);
 static void	mptable_bus_info_free(struct mptable_bus_info *);
@@ -351,10 +360,14 @@ cpumask_t smp_active_mask = 1;	/* which cpus are ready for IPIs etc? */
 SYSCTL_INT(_machdep, OID_AUTO, smp_active, CTLFLAG_RD, &smp_active_mask, 0, "");
 static u_int	bootMP_size;
 
+int			imcr_present;
+
 static vm_paddr_t	mptable_fps_phyaddr;
 static int		mptable_use_default;
-static TAILQ_HEAD(, mptable_pci_int) mptable_pci_int_list =
+static TAILQ_HEAD(mptable_pci_int_list, mptable_pci_int) mptable_pci_int_list =
 	TAILQ_HEAD_INITIALIZER(mptable_pci_int_list);
+static TAILQ_HEAD(mptable_ioapic_list, mptable_ioapic) mptable_ioapic_list =
+	TAILQ_HEAD_INITIALIZER(mptable_ioapic_list);
 
 /*
  * Calculate usable address in base memory for AP trampoline code.
@@ -399,6 +412,8 @@ mptable_probe(void)
 		kprintf("MPTABLE: use default configuration\n");
 		mptable_use_default = 1;
 	}
+	if (mpt.mp_fps->mpfb2 & 0x80)
+		imcr_present = 1;
 
 	mptable_unmap(&mpt);
 }
@@ -524,10 +539,12 @@ mp_announce(void)
 	}
 
 if (apic_io_enable) {
-	for (x = 0; x < mp_napics; ++x) {
-		kprintf(" io%d (APIC): apic id: %2d", x, IO_TO_ID(x));
-		kprintf(", version: 0x%08x", io_apic_versions[x]);
-		kprintf(", at 0x%08lx\n", io_apic_address[x]);
+	if (ioapic_use_old) {
+		for (x = 0; x < mp_napics; ++x) {
+			kprintf(" io%d (APIC): apic id: %2d", x, IO_TO_ID(x));
+			kprintf(", version: 0x%08x", io_apic_versions[x]);
+			kprintf(", at 0x%08lx\n", io_apic_address[x]);
+		}
 	}
 } else {
 	kprintf(" Warning: APIC I/O disabled\n");
@@ -657,18 +674,29 @@ mp_enable(u_int boot_addr)
 
 	lapic_config();
 
+	/* Initialize BSP's local APIC */
+	lapic_init(TRUE);
+
 	if (apic_io_enable)
 		ioapic_config();
 
-	if (mptable_fps_phyaddr) {
-		mptable_map(&mpt);
-		mptable_imcr(&mpt);
-		mptable_unmap(&mpt);
-	}
-if (apic_io_enable) {
+if (apic_io_enable && ioapic_use_old) {
+	register_t ef;
 
 	if (!mptable_fps_phyaddr)
 		panic("no MP table, disable APIC_IO! (set hw.apic_io_enable=0)\n");
+
+	crit_enter();
+
+	ef = read_rflags();
+	cpu_disable_intr();
+
+	/*
+	 * Switch to I/O APIC MachIntrABI and reconfigure
+	 * the default IDT entries.
+	 */
+	MachIntrABI = MachIntrABI_IOAPIC;
+	MachIntrABI.setdefault();
 
 	mptable_map(&mpt);
 
@@ -697,31 +725,15 @@ if (apic_io_enable) {
 		if (io_apic_setup(apic) < 0)
 			panic("IO APIC setup failure");
 
+	write_rflags(ef);
+
+	MachIntrABI.cleanup();
+
+	crit_exit();
 }
 
-	/*
-	 * These are required for SMP operation
-	 */
-
-	/* install a 'Spurious INTerrupt' vector */
-	setidt(XSPURIOUSINT_OFFSET, Xspuriousint,
-	       SDT_SYSIGT, SEL_KPL, 0);
-
-	/* install an inter-CPU IPI for TLB invalidation */
-	setidt(XINVLTLB_OFFSET, Xinvltlb,
-	       SDT_SYSIGT, SEL_KPL, 0);
-
-	/* install an inter-CPU IPI for IPIQ messaging */
-	setidt(XIPIQ_OFFSET, Xipiq,
-	       SDT_SYSIGT, SEL_KPL, 0);
-
-	/* install a timer vector */
-	setidt(XTIMER_OFFSET, Xtimer,
-	       SDT_SYSIGT, SEL_KPL, 0);
-	
-	/* install an inter-CPU IPI for CPU stop/restart */
-	setidt(XCPUSTOP_OFFSET, Xcpustop,
-	       SDT_SYSIGT, SEL_KPL, 0);
+	/* Finalize PIC */
+	MachIntrABI.finalize();
 
 	/* start each Application Processor */
 	start_all_aps(boot_addr);
@@ -960,7 +972,7 @@ mptable_pass2(struct mptable_pos *mpt)
 	    M_DEVBUF, M_WAITOK);
 
 	for (x = 0; x < mp_napics; x++)
-		ioapic[x] = permanent_io_mapping(io_apic_address[x]);
+		ioapic[x] = ioapic_map(io_apic_address[x]);
 
 	/* clear various tables */
 	for (x = 0; x < NAPICID; ++x) {
@@ -1558,6 +1570,9 @@ mp_set_cpuids(int cpu_id, int apic_id)
 {
 	CPU_TO_ID(cpu_id) = apic_id;
 	ID_TO_CPU(apic_id) = cpu_id;
+
+	if (apic_id > lapic_id_max)
+		lapic_id_max = apic_id;
 }
 
 static int
@@ -2117,7 +2132,7 @@ mptable_default(int type)
  * block is assumed not to cross a page boundary.
  */
 void *
-permanent_io_mapping(vm_paddr_t pa)
+ioapic_map(vm_paddr_t pa)
 {
 	KKASSERT(pa < 0x100000000LL);
 
@@ -2143,12 +2158,6 @@ start_all_aps(u_int boot_addr)
 	struct privatespace *ps;
 
 	POSTCODE(START_ALL_APS_POST);
-
-	/* Initialize BSP's local APIC */
-	apic_initialize(TRUE);
-
-	/* Finalize PIC */
-	MachIntrABI.finalize();
 
 	/* install the AP 1st level boot code */
 	pmap_kenter(va, boot_address);
@@ -2785,7 +2794,7 @@ ap_init(void)
 	}
 
 	/* Initialize AP's local APIC for irq's */
-	apic_initialize(FALSE);
+	lapic_init(FALSE);
 
 	/* Set memory range attributes for this CPU to match the BSP */
 	mem_range_AP_init();
@@ -2888,7 +2897,15 @@ mptable_bus_info_callback(void *xarg, const void *pos, int type)
 
 	if (type != 1)
 		return 0;
+
 	ent = pos;
+	TAILQ_FOREACH(bus, &bus_info->mbi_list, mb_link) {
+		if (bus->mb_id == ent->bus_id) {
+			kprintf("mptable_bus_info_alloc: duplicated bus id "
+				"(%d)\n", bus->mb_id);
+			return EINVAL;
+		}
+	}
 
 	bus = NULL;
 	if (strncmp(ent->bus_type, "PCI", 3) == 0) {
@@ -2900,23 +2917,8 @@ mptable_bus_info_callback(void *xarg, const void *pos, int type)
 	}
 
 	if (bus != NULL) {
-		const struct mptable_bus *bus1;
-
-		TAILQ_FOREACH(bus1, &bus_info->mbi_list, mb_link) {
-			if (bus1->mb_id == ent->bus_id) {
-				kprintf("mptable_bus_info_alloc: "
-					"duplicated bus id (%d)\n", bus1->mb_id);
-				break;
-			}
-		}
-
-		if (bus1 == NULL) {
-			bus->mb_id = ent->bus_id;
-			TAILQ_INSERT_TAIL(&bus_info->mbi_list, bus, mb_link);
-		} else {
-			kfree(bus, M_TEMP);
-			return EINVAL;
-		}
+		bus->mb_id = ent->bus_id;
+		TAILQ_INSERT_TAIL(&bus_info->mbi_list, bus, mb_link);
 	}
 	return 0;
 }
@@ -3019,14 +3021,6 @@ mptable_lapic_pass2_callback(void *xarg, const void *pos, int type)
 		}
 	}
 	return 0;
-}
-
-static void
-mptable_imcr(struct mptable_pos *mpt)
-{
-	/* record whether PIC or virtual-wire mode */
-	machintr_setvar_simple(MACHINTR_VAR_IMCR_PRESENT,
-			       mpt->mp_fps->mpfb2 & 0x80);
 }
 
 static void
@@ -3216,9 +3210,111 @@ SYSINIT(mptable_lapic, SI_BOOT2_PRESMP, SI_ORDER_ANY,
 	mptable_lapic_enum_register, 0);
 
 static int
+mptable_ioapic_list_callback(void *xarg, const void *pos, int type)
+{
+	const struct IOAPICENTRY *ent;
+	struct mptable_ioapic *nioapic, *ioapic;
+
+	if (type != 2)
+		return 0;
+	ent = pos;
+
+	if ((ent->apic_flags & IOAPICENTRY_FLAG_EN) == 0)
+		return 0;
+
+	if (ent->apic_address == 0) {
+		kprintf("mptable_ioapic_create_list: zero IOAPIC addr\n");
+		return EINVAL;
+	}
+
+	TAILQ_FOREACH(ioapic, &mptable_ioapic_list, mio_link) {
+		if (ioapic->mio_apic_id == ent->apic_id) {
+			kprintf("mptable_ioapic_create_list: duplicated "
+				"apic id %d\n", ioapic->mio_apic_id);
+			return EINVAL;
+		}
+		if (ioapic->mio_addr == ent->apic_address) {
+			kprintf("mptable_ioapic_create_list: overlapped "
+				"IOAPIC addr 0x%08x", ioapic->mio_addr);
+			return EINVAL;
+		}
+	}
+
+	nioapic = kmalloc(sizeof(*nioapic), M_DEVBUF, M_WAITOK | M_ZERO);
+	nioapic->mio_apic_id = ent->apic_id;
+	nioapic->mio_addr = ent->apic_address;
+
+	/*
+	 * Create IOAPIC list in ascending order of APIC ID
+	 */
+	TAILQ_FOREACH_REVERSE(ioapic, &mptable_ioapic_list,
+	    mptable_ioapic_list, mio_link) {
+		if (nioapic->mio_apic_id > ioapic->mio_apic_id) {
+			TAILQ_INSERT_AFTER(&mptable_ioapic_list,
+			    ioapic, nioapic, mio_link);
+			break;
+		}
+	}
+	if (ioapic == NULL)
+		TAILQ_INSERT_HEAD(&mptable_ioapic_list, nioapic, mio_link);
+
+	return 0;
+}
+
+static void
+mptable_ioapic_create_list(void)
+{
+	struct mptable_ioapic *ioapic;
+	struct mptable_pos mpt;
+	int idx, error;
+
+	if (mptable_fps_phyaddr == 0)
+		return;
+
+	if (mptable_use_default) {
+		ioapic = kmalloc(sizeof(*ioapic), M_DEVBUF, M_WAITOK | M_ZERO);
+		ioapic->mio_idx = 0;
+		ioapic->mio_apic_id = 0;	/* NOTE: any value is ok here */
+		ioapic->mio_addr = 0xfec00000;	/* XXX magic number */
+
+		TAILQ_INSERT_HEAD(&mptable_ioapic_list, ioapic, mio_link);
+		return;
+	}
+
+	error = mptable_map(&mpt);
+	if (error)
+		panic("mptable_ioapic_create_list: mptable_map failed\n");
+	KKASSERT(!MPTABLE_POS_USE_DEFAULT(&mpt));
+
+	error = mptable_iterate_entries(mpt.mp_cth,
+		    mptable_ioapic_list_callback, NULL);
+	if (error) {
+		while ((ioapic = TAILQ_FIRST(&mptable_ioapic_list)) != NULL) {
+			TAILQ_REMOVE(&mptable_ioapic_list, ioapic, mio_link);
+			kfree(ioapic, M_DEVBUF);
+		}
+		goto done;
+	}
+
+	/*
+	 * Assign index number for each IOAPIC
+	 */
+	idx = 0;
+	TAILQ_FOREACH(ioapic, &mptable_ioapic_list, mio_link) {
+		ioapic->mio_idx = idx;
+		++idx;
+	}
+done:
+	mptable_unmap(&mpt);
+}
+SYSINIT(mptable_ioapic_list, SI_BOOT2_PRESMP, SI_ORDER_SECOND,
+	mptable_ioapic_create_list, 0);
+
+static int
 mptable_pci_int_callback(void *xarg, const void *pos, int type)
 {
 	const struct mptable_bus_info *bus_info = xarg;
+	const struct mptable_ioapic *ioapic;
 	const struct mptable_bus *bus;
 	struct mptable_pci_int *pci_int;
 	const struct INTENTRY *ent;
@@ -3239,6 +3335,16 @@ mptable_pci_int_callback(void *xarg, const void *pos, int type)
 	if (bus == NULL)
 		return 0;
 
+	TAILQ_FOREACH(ioapic, &mptable_ioapic_list, mio_link) {
+		if (ioapic->mio_apic_id == ent->dst_apic_id)
+			break;
+	}
+	if (ioapic == NULL) {
+		kprintf("MPTABLE: warning PCI int dst apic id %d "
+			"does not exist\n", ent->dst_apic_id);
+		return 0;
+	}
+
 	pci_pin = ent->src_bus_irq & 0x3;
 	pci_dev = (ent->src_bus_irq >> 2) & 0x1f;
 
@@ -3246,7 +3352,7 @@ mptable_pci_int_callback(void *xarg, const void *pos, int type)
 		if (pci_int->mpci_bus == ent->src_bus_id &&
 		    pci_int->mpci_dev == pci_dev &&
 		    pci_int->mpci_pin == pci_pin) {
-			if (pci_int->mpci_ioapic == ent->dst_apic_id &&
+			if (pci_int->mpci_ioapic_idx == ioapic->mio_idx &&
 			    pci_int->mpci_ioapic_pin == ent->dst_apic_int) {
 				kprintf("MPTABLE: warning duplicated "
 					"PCI int entry for "
@@ -3263,9 +3369,9 @@ mptable_pci_int_callback(void *xarg, const void *pos, int type)
 					pci_int->mpci_bus,
 					pci_int->mpci_dev,
 					pci_int->mpci_pin,
-					pci_int->mpci_ioapic,
+					pci_int->mpci_ioapic_idx,
 					pci_int->mpci_ioapic_pin,
-					ent->dst_apic_id,
+					ioapic->mio_idx,
 					ent->dst_apic_int);
 				return EINVAL;
 			}
@@ -3277,7 +3383,7 @@ mptable_pci_int_callback(void *xarg, const void *pos, int type)
 	pci_int->mpci_bus = ent->src_bus_id;
 	pci_int->mpci_dev = pci_dev;
 	pci_int->mpci_pin = pci_pin;
-	pci_int->mpci_ioapic = ent->dst_apic_id;
+	pci_int->mpci_ioapic_idx = ioapic->mio_idx;
 	pci_int->mpci_ioapic_pin = ent->dst_apic_int;
 
 	TAILQ_INSERT_TAIL(&mptable_pci_int_list, pci_int, mpci_link);
@@ -3301,6 +3407,9 @@ mptable_pci_int_register(void)
 	if (mptable_use_default)
 		return;
 
+	if (TAILQ_EMPTY(&mptable_ioapic_list))
+		return;
+
 	error = mptable_map(&mpt);
 	if (error)
 		panic("mptable_pci_int_register: mptable_map failed\n");
@@ -3312,6 +3421,7 @@ mptable_pci_int_register(void)
 	if (TAILQ_EMPTY(&bus_info.mbi_list))
 		goto done;
 
+	force_pci0 = 0;
 	npcibus = 0;
 	TAILQ_FOREACH(bus, &bus_info.mbi_list, mb_link) {
 		if (bus->mb_type == MPTABLE_BUS_PCI)
@@ -3349,46 +3459,46 @@ SYSINIT(mptable_pci, SI_BOOT2_PRESMP, SI_ORDER_ANY,
 
 struct mptable_ioapic_probe_cbarg {
 	const struct mptable_bus_info *bus_info;
-	int 	ioapic_cnt;
 };
 
 static int
 mptable_ioapic_probe_callback(void *xarg, const void *pos, int type)
 {
 	struct mptable_ioapic_probe_cbarg *arg = xarg;
+	const struct mptable_ioapic *ioapic;
+	const struct mptable_bus *bus;
+	const struct INTENTRY *ent;
 
-	if (type == 3) {
-		const struct INTENTRY *ent = pos;
-		const struct mptable_bus *bus;
+	if (type != 3)
+		return 0;
+	ent = pos;
 
-		if (ent->int_type != 0)
-			return 0;
+	if (ent->int_type != 0)
+		return 0;
 
-		TAILQ_FOREACH(bus, &arg->bus_info->mbi_list, mb_link) {
-			if (bus->mb_type == MPTABLE_BUS_ISA &&
-			    bus->mb_id == ent->src_bus_id)
-				break;
-		}
-		if (bus == NULL)
-			return 0;
+	TAILQ_FOREACH(bus, &arg->bus_info->mbi_list, mb_link) {
+		if (bus->mb_type == MPTABLE_BUS_ISA &&
+		    bus->mb_id == ent->src_bus_id)
+			break;
+	}
+	if (bus == NULL)
+		return 0;
 
-		/* XXX magic number */
-		if (ent->src_bus_irq >= 16) {
-			kprintf("mptable_ioapic_probe: invalid ISA irq "
-				"(%d)\n", ent->src_bus_irq);
-			return EINVAL;
-		}
-	} else if (type == 2) {
-		const struct IOAPICENTRY *ent = pos;
+	TAILQ_FOREACH(ioapic, &mptable_ioapic_list, mio_link) {
+		if (ioapic->mio_apic_id == ent->dst_apic_id)
+			break;
+	}
+	if (ioapic == NULL) {
+		kprintf("MPTABLE: warning ISA int dst apic id %d "
+			"does not exist\n", ent->dst_apic_id);
+		return 0;
+	}
 
-		if ((ent->apic_flags & IOAPICENTRY_FLAG_EN) == 0)
-			return 0;
-
-		if (ent->apic_address == 0) {
-			kprintf("mptable_ioapic_probe: zero IOAPIC address\n");
-			return EINVAL;
-		}
-		arg->ioapic_cnt++;
+	/* XXX magic number */
+	if (ent->src_bus_irq >= 16) {
+		kprintf("mptable_ioapic_probe: invalid ISA irq (%d)\n",
+			ent->src_bus_irq);
+		return EINVAL;
 	}
 	return 0;
 }
@@ -3408,6 +3518,9 @@ mptable_ioapic_probe(struct ioapic_enumerator *e)
 	if (mptable_use_default)
 		return 0;
 
+	if (TAILQ_EMPTY(&mptable_ioapic_list))
+		return ENXIO;
+
 	error = mptable_map(&mpt);
 	if (error)
 		panic("mptable_ioapic_probe: mptable_map failed\n");
@@ -3422,37 +3535,11 @@ mptable_ioapic_probe(struct ioapic_enumerator *e)
 
 	error = mptable_iterate_entries(cth,
 		    mptable_ioapic_probe_callback, &arg);
-	if (!error) {
-		if (arg.ioapic_cnt == 0) {
-			kprintf("mptable_ioapic_probe: no IOAPIC\n");
-			error = ENXIO;
-		}
-	}
 
 	mptable_bus_info_free(&bus_info);
 	mptable_unmap(&mpt);
 
 	return error;
-}
-
-static int
-mptable_ioapic_enum_callback(void *xarg, const void *pos, int type)
-{
-	const struct IOAPICENTRY *ent;
-
-	if (type != 2)
-		return 0;
-
-	ent = pos;
-
-	if ((ent->apic_flags & IOAPICENTRY_FLAG_EN) == 0)
-		return 0;
-
-	if (bootverbose) {
-		kprintf("MPTABLE: IOAPIC addr 0x%08x, apic id %d\n",
-			ent->apic_address, ent->apic_id);
-	}
-	return 0;
 }
 
 struct mptable_ioapic_int_cbarg {
@@ -3464,6 +3551,7 @@ static int
 mptable_ioapic_int_callback(void *xarg, const void *pos, int type)
 {
 	struct mptable_ioapic_int_cbarg *arg = xarg;
+	const struct mptable_ioapic *ioapic;
 	const struct mptable_bus *bus;
 	const struct INTENTRY *ent;
 
@@ -3484,11 +3572,40 @@ mptable_ioapic_int_callback(void *xarg, const void *pos, int type)
 	if (bus == NULL)
 		return 0;
 
-	/* XXX rough estimation */
-	if (ent->src_bus_irq != ent->dst_apic_int) {
-		if (bootverbose) {
-			kprintf("MPTABLE: INTSRC irq %d -> GSI %d\n",
-				ent->src_bus_irq, ent->dst_apic_int);
+	TAILQ_FOREACH(ioapic, &mptable_ioapic_list, mio_link) {
+		if (ioapic->mio_apic_id == ent->dst_apic_id)
+			break;
+	}
+	if (ioapic == NULL) {
+		kprintf("MPTABLE: warning ISA int dst apic id %d "
+			"does not exist\n", ent->dst_apic_id);
+		return 0;
+	}
+
+	if (!ioapic_use_old) {
+		int gsi;
+
+		if (ent->dst_apic_int >= ioapic->mio_npin) {
+			panic("mptable_ioapic_enumerate: invalid I/O APIC "
+			      "pin %d, should be < %d",
+			      ent->dst_apic_int, ioapic->mio_npin);
+		}
+		gsi = ioapic->mio_gsi_base + ent->dst_apic_int;
+
+		if (ent->src_bus_irq != gsi) {
+			if (bootverbose) {
+				kprintf("MPTABLE: INTSRC irq %d -> GSI %d\n",
+					ent->src_bus_irq, gsi);
+			}
+			ioapic_intsrc(ent->src_bus_irq, gsi);
+		}
+	} else {
+		/* XXX rough estimation */
+		if (ent->src_bus_irq != ent->dst_apic_int) {
+			if (bootverbose) {
+				kprintf("MPTABLE: INTSRC irq %d -> GSI %d\n",
+					ent->src_bus_irq, ent->dst_apic_int);
+			}
 		}
 	}
 	return 0;
@@ -3498,19 +3615,53 @@ static void
 mptable_ioapic_enumerate(struct ioapic_enumerator *e)
 {
 	struct mptable_bus_info bus_info;
+	struct mptable_ioapic *ioapic;
 	struct mptable_pos mpt;
 	mpcth_t cth;
 	int error;
 
 	KKASSERT(mptable_fps_phyaddr != 0);
+	KKASSERT(!TAILQ_EMPTY(&mptable_ioapic_list));
+
+	TAILQ_FOREACH(ioapic, &mptable_ioapic_list, mio_link) {
+		if (!ioapic_use_old) {
+			const struct mptable_ioapic *prev_ioapic;
+			uint32_t ver;
+			void *addr;
+
+			addr = ioapic_map(ioapic->mio_addr);
+
+			ver = ioapic_read(addr, IOAPIC_VER);
+			ioapic->mio_npin = ((ver & IOART_VER_MAXREDIR)
+					    >> MAXREDIRSHIFT) + 1;
+
+			prev_ioapic = TAILQ_PREV(ioapic,
+					mptable_ioapic_list, mio_link);
+			if (prev_ioapic == NULL) {
+				ioapic->mio_gsi_base = 0;
+			} else {
+				ioapic->mio_gsi_base =
+					prev_ioapic->mio_gsi_base +
+					prev_ioapic->mio_npin;
+			}
+			ioapic_add(addr, ioapic->mio_gsi_base,
+			    ioapic->mio_npin);
+		}
+		if (bootverbose) {
+			kprintf("MPTABLE: IOAPIC addr 0x%08x, "
+				"apic id %d, idx %d, gsi base %d, npin %d\n",
+				ioapic->mio_addr,
+				ioapic->mio_apic_id,
+				ioapic->mio_idx,
+				ioapic->mio_gsi_base,
+				ioapic->mio_npin);
+		}
+	}
 
 	if (mptable_use_default) {
-		if (bootverbose) {
-			kprintf("MPTABLE: IOAPIC address 0xfec00000 "
-				"(default)\n");
+		if (bootverbose)
 			kprintf("MPTABLE: INTSRC irq 0 -> GSI 2 (default)\n");
-		}
-		/* TODO default ioapic and intsrc */
+		ioapic_intsrc(0, 2);
 		return;
 	}
 
@@ -3521,17 +3672,12 @@ mptable_ioapic_enumerate(struct ioapic_enumerator *e)
 
 	cth = mpt.mp_cth;
 
-	error = mptable_iterate_entries(cth,
-		    mptable_ioapic_enum_callback, NULL);
-	if (error)
-		panic("mptable_ioapic_enum failed\n");
-
 	mptable_bus_info_alloc(cth, &bus_info);
 
 	if (TAILQ_EMPTY(&bus_info.mbi_list)) {
 		if (bootverbose)
 			kprintf("MPTABLE: INTSRC irq 0 -> GSI 2 (no bus)\n");
-		/* TODO default intsrc */
+		ioapic_intsrc(0, 2);
 	} else {
 		struct mptable_ioapic_int_cbarg arg;
 
@@ -3548,7 +3694,7 @@ mptable_ioapic_enumerate(struct ioapic_enumerator *e)
 				kprintf("MPTABLE: INTSRC irq 0 -> GSI 2 "
 					"(no int)\n");
 			}
-			/* TODO default intsrc */
+			ioapic_intsrc(0, 2);
 		}
 	}
 
@@ -3570,3 +3716,56 @@ mptable_ioapic_enum_register(void)
 }
 SYSINIT(mptable_ioapic, SI_BOOT2_PRESMP, SI_ORDER_ANY,
 	mptable_ioapic_enum_register, 0);
+
+void
+mptable_pci_int_dump(void)
+{
+	const struct mptable_pci_int *pci_int;
+
+	TAILQ_FOREACH(pci_int, &mptable_pci_int_list, mpci_link) {
+		kprintf("MPTABLE: %d:%d.%c -> IOAPIC %d.%d\n",
+			pci_int->mpci_bus,
+			pci_int->mpci_dev,
+			pci_int->mpci_pin + 'a',
+			pci_int->mpci_ioapic_idx,
+			pci_int->mpci_ioapic_pin);
+	}
+}
+
+int
+mptable_pci_int_route(int bus, int dev, int pin, int intline)
+{
+	const struct mptable_pci_int *pci_int;
+	int irq = -1;
+
+	KKASSERT(pin >= 1);
+	--pin;	/* zero based */
+
+	TAILQ_FOREACH(pci_int, &mptable_pci_int_list, mpci_link) {
+		if (pci_int->mpci_bus == bus &&
+		    pci_int->mpci_dev == dev &&
+		    pci_int->mpci_pin == pin)
+			break;
+	}
+	if (pci_int != NULL) {
+		int gsi;
+
+		gsi = ioapic_gsi(pci_int->mpci_ioapic_idx,
+			pci_int->mpci_ioapic_pin);
+		if (gsi >= 0) {
+			irq = ioapic_abi_find_gsi(gsi,
+				INTR_TRIGGER_LEVEL, INTR_POLARITY_LOW);
+		}
+	}
+
+	if (irq < 0) {
+		if (bootverbose) {
+			kprintf("MPTABLE: fixed interrupt routing "
+				"for %d:%d.%c\n", bus, dev, pin + 'a');
+		}
+
+		irq = ioapic_abi_find_irq(intline,
+			INTR_TRIGGER_LEVEL, INTR_POLARITY_LOW);
+	}
+	return irq;
+}

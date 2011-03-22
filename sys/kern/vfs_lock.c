@@ -57,7 +57,6 @@
 #include <sys/buf2.h>
 #include <sys/thread2.h>
 #include <sys/sysref2.h>
-#include <sys/mplock2.h>
 
 static void vnode_terminate(struct vnode *vp);
 static boolean_t vnode_ctor(void *obj, void *private, int ocflags);
@@ -70,7 +69,7 @@ static struct sysref_class vnode_sysref_class = {
 	.proto =	SYSREF_PROTO_VNODE,
 	.offset =	offsetof(struct vnode, v_sysref),
 	.objsize =	sizeof(struct vnode),
-	.mag_capacity =	256,
+	.nom_cache =	256,
 	.flags =	SRC_MANAGEDINIT,
 	.ctor =		vnode_ctor,
 	.dtor =		vnode_dtor,

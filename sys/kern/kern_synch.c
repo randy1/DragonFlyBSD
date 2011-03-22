@@ -63,7 +63,6 @@
 #include <sys/thread2.h>
 #include <sys/spinlock2.h>
 #include <sys/mutex2.h>
-#include <sys/mplock2.h>
 
 #include <machine/cpu.h>
 #include <machine/smp.h>
@@ -212,7 +211,9 @@ schedcpu_stats(struct proc *p, void *data __unused)
 	if (p->p_stat == SIDL)
 		return(0);
 
-	crit_enter();
+	PHOLD(p);
+	lwkt_gettoken(&p->p_token);
+
 	p->p_swtime++;
 	FOREACH_LWP_IN_PROC(lp, p) {
 		if (lp->lwp_stat == LSSLEEP)
@@ -228,7 +229,8 @@ schedcpu_stats(struct proc *p, void *data __unused)
 			lp->lwp_pctcpu = (lp->lwp_pctcpu * ccpu) >> FSHIFT;
 		}
 	}
-	crit_exit();
+	lwkt_reltoken(&p->p_token);
+	PRELE(p);
 	return(0);
 }
 
@@ -243,12 +245,15 @@ schedcpu_resource(struct proc *p, void *data __unused)
 	u_int64_t ttime;
 	struct lwp *lp;
 
-	crit_enter();
-	if (p->p_stat == SIDL || 
-	    p->p_stat == SZOMB ||
-	    p->p_limit == NULL
-	) {
-		crit_exit();
+	if (p->p_stat == SIDL)
+		return(0);
+
+	PHOLD(p);
+	lwkt_gettoken(&p->p_token);
+
+	if (p->p_stat == SZOMB || p->p_limit == NULL) {
+		lwkt_reltoken(&p->p_token);
+		PRELE(p);
 		return(0);
 	}
 
@@ -277,7 +282,8 @@ schedcpu_resource(struct proc *p, void *data __unused)
 	default:
 		break;
 	}
-	crit_exit();
+	lwkt_reltoken(&p->p_token);
+	PRELE(p);
 	return(0);
 }
 

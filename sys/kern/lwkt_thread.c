@@ -147,6 +147,9 @@ SYSCTL_INT(_lwkt, OID_AUTO, spin_fatal, CTLFLAG_RW,
 static int preempt_enable = 1;
 SYSCTL_INT(_lwkt, OID_AUTO, preempt_enable, CTLFLAG_RW,
 	&preempt_enable, 0, "Enable preemption");
+static int lwkt_cache_threads = 32;
+SYSCTL_INT(_lwkt, OID_AUTO, cache_threads, CTLFLAG_RD,
+	&lwkt_cache_threads, 0, "thread+kstack cache");
 
 static __cachealign int lwkt_cseq_rindex;
 static __cachealign int lwkt_cseq_windex;
@@ -233,14 +236,17 @@ _lwkt_thread_dtor(void *obj, void *privdata)
 
 /*
  * Initialize the lwkt s/system.
+ *
+ * Nominally cache up to 32 thread + kstack structures.
  */
 void
 lwkt_init(void)
 {
-    /* An objcache has 2 magazines per CPU so divide cache size by 2. */
-    thread_cache = objcache_create_mbacked(M_THREAD, sizeof(struct thread),
-			NULL, CACHE_NTHREADS/2,
-			_lwkt_thread_ctor, _lwkt_thread_dtor, NULL);
+    TUNABLE_INT("lwkt.cache_threads", &lwkt_cache_threads);
+    thread_cache = objcache_create_mbacked(
+				M_THREAD, sizeof(struct thread),
+				NULL, lwkt_cache_threads,
+				_lwkt_thread_ctor, _lwkt_thread_dtor, NULL);
 }
 
 /*
@@ -496,7 +502,7 @@ lwkt_free_thread(thread_t td)
  * cpusync operations if we run any IPIs prior to switching the thread out.
  *
  * WE MUST BE VERY CAREFUL NOT TO RUN SPLZ DIRECTLY OR INDIRECTLY IF
- * THE CURRENET THREAD HAS BEEN DESCHEDULED!
+ * THE CURRENT THREAD HAS BEEN DESCHEDULED!
  */
 void
 lwkt_switch(void)
@@ -1502,6 +1508,11 @@ lwkt_fairq_accumulate(globaldata_t gd, thread_t td)
  * We must be sure to remove ourselves from the current cpu's tsleepq
  * before potentially moving to another queue.  The thread can be on
  * a tsleepq due to a left-over tsleep_interlock().
+ *
+ * We also have to make sure that the switch code doesn't allow an IPI
+ * processing operation to leak in between our send and our switch, or
+ * any other potential livelock such that might occur when we release the
+ * current process designation, so do that first.
  */
 #ifdef SMP
 static void lwkt_setcpu_remote(void *arg);
@@ -1515,6 +1526,8 @@ lwkt_setcpu_self(globaldata_t rgd)
 
     if (td->td_gd != rgd) {
 	crit_enter_quick(td);
+	if (td->td_release)
+	    td->td_release(td);
 	if (td->td_flags & TDF_TSLEEPQ)
 	    tsleep_remove(td);
 	td->td_flags |= TDF_MIGRATING;

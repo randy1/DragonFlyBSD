@@ -52,9 +52,7 @@
 #include <sys/priv.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
-#include <sys/mplock2.h>
 #include <sys/mqueue.h>
-#include <sys/objcache.h>
 #include <sys/proc.h>
 #include <sys/queue.h>
 #include <sys/event.h>
@@ -79,7 +77,6 @@ static u_int			mq_def_maxmsg = 32;
 static u_int			mq_max_maxmsg = 16 * 32;
 
 struct lock			mqlist_mtx;
-static struct objcache *	mqmsg_cache;
 static LIST_HEAD(, mqueue)	mqueue_head =
 	LIST_HEAD_INITIALIZER(mqueue_head);
 
@@ -113,26 +110,12 @@ static struct fileops mqops = {
 MALLOC_DECLARE(M_MQBUF);
 MALLOC_DEFINE(M_MQBUF, "mqueues", "Buffers to message queues");
 
-/* Malloc arguments for object cache */
-struct objcache_malloc_args mqueue_malloc_args = {
-	sizeof(struct mqueue), M_MQBUF };
-
 /*
  * Initialize POSIX message queue subsystem.
  */
 void
 mqueue_sysinit(void)
 {
-	mqmsg_cache = objcache_create("mqmsg_cache",
-	    0,		/* infinite depot's capacity */
-	    0,		/* default magazine's capacity */
-	    NULL,	/* constructor */
-	    NULL,	/* deconstructor */
-	    NULL,
-	    objcache_malloc_alloc,
-	    objcache_malloc_free,
-	    &mqueue_malloc_args);
-
 	lockinit(&mqlist_mtx, "mqlist_mtx", 0, LK_CANRECURSE);
 }
 
@@ -142,12 +125,7 @@ mqueue_sysinit(void)
 static void
 mqueue_freemsg(struct mq_msg *msg, const size_t size)
 {
-
-	if (size > MQ_DEF_MSGSIZE) {
-		kfree(msg, M_MQBUF);
-	} else {
-		objcache_put(mqmsg_cache, msg);
-	}
+	kfree(msg, M_MQBUF);
 }
 
 /*
@@ -316,9 +294,9 @@ mq_stat_fop(file_t *fp, struct stat *st, struct ucred *cred)
 }
 
 static struct filterops mqfiltops_read =
-	{ FILTEROP_ISFD, NULL, mqfilter_read_detach, mqfilter_read };
+{ FILTEROP_ISFD|FILTEROP_MPSAFE, NULL, mqfilter_read_detach, mqfilter_read };
 static struct filterops mqfiltops_write =
-	{ FILTEROP_ISFD, NULL, mqfilter_write_detach, mqfilter_write };
+{ FILTEROP_ISFD|FILTEROP_MPSAFE, NULL, mqfilter_write_detach, mqfilter_write };
 
 static int
 mq_kqfilter_fop(struct file *fp, struct knote *kn)
@@ -471,7 +449,9 @@ sys_mq_open(struct mq_open_args *uap)
 	}
 
 	/* Get the name from the user-space */
-	name = kmalloc(MQ_NAMELEN, M_MQBUF, M_WAITOK | M_ZERO);
+	name = kmalloc(MQ_NAMELEN, M_MQBUF, M_WAITOK | M_ZERO | M_NULLOK);
+	if (name == NULL)
+		return (ENOMEM);
 	error = copyinstr(SCARG(uap, name), name, MQ_NAMELEN - 1, NULL);
 	if (error) {
 		kfree(name, M_MQBUF);
@@ -521,7 +501,12 @@ sys_mq_open(struct mq_open_args *uap)
 		 * Allocate new mqueue, initialize data structures,
 		 * copy the name, attributes and set the flag.
 		 */
-		mq_new = kmalloc(sizeof(struct mqueue), M_MQBUF, M_WAITOK | M_ZERO);
+		mq_new = kmalloc(sizeof(struct mqueue), M_MQBUF, 
+					M_WAITOK | M_ZERO | M_NULLOK);
+		if (mq_new == NULL) {
+			kfree(name, M_MQBUF);
+			return (ENOMEM);
+		}
 
 		lockinit(&mq_new->mq_mtx, "mq_new->mq_mtx", 0, LK_CANRECURSE);
 		for (i = 0; i < (MQ_PQSIZE + 1); i++) {
@@ -830,11 +815,10 @@ mq_send1(struct lwp *l, mqd_t mqdes, const char *msg_ptr, size_t msg_len,
 	if (size > mq_max_msgsize)
 		return EMSGSIZE;
 
-	if (size > MQ_DEF_MSGSIZE) {
-		msg = kmalloc(size, M_MQBUF, M_WAITOK);
-	} else {
-		msg = objcache_get(mqmsg_cache, M_WAITOK);
-	}
+	msg = kmalloc(size, M_MQBUF, M_WAITOK | M_NULLOK);
+	if (msg == NULL)
+		return (ENOMEM);
+
 
 	/* Get the data from user-space */
 	error = copyin(msg_ptr, msg->msg_ptr, msg_len);
@@ -1114,7 +1098,9 @@ sys_mq_unlink(struct mq_unlink_args *uap)
 	int error, refcnt = 0;
 
 	/* Get the name from the user-space */
-	name = kmalloc(MQ_NAMELEN, M_MQBUF, M_WAITOK | M_ZERO);
+	name = kmalloc(MQ_NAMELEN, M_MQBUF, M_WAITOK | M_ZERO | M_NULLOK);
+	if (name == NULL)
+		return (ENOMEM);
 	error = copyinstr(SCARG(uap, name), name, MQ_NAMELEN - 1, NULL);
 	if (error) {
 		kfree(name, M_MQBUF);

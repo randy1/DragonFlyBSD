@@ -1,4 +1,3 @@
-# $DragonFly: src/sys/conf/kern.pre.mk,v 1.8 2008/11/17 11:55:19 swildner Exp $
 #
 # This Makefile covers the top part of the MI kernel build instructions
 #
@@ -84,7 +83,7 @@ PROFILE_C= ${CC} -c ${CFLAGS} ${.IMPSRC}
 NORMAL_M= awk -f $S/tools/makeobjops.awk -- -c $<; \
 	${CC} -c ${CFLAGS} ${PROF} ${.PREFIX}.c
 
-.if !defined(NO_WERROR) && ${CCVER} == "gcc41"
+.if !defined(NO_WERROR) && (${CCVER} == "gcc41" || ${CCVER} == "gcc44")
 WERROR=-Werror
 .endif
 
@@ -96,6 +95,11 @@ SYSTEM_OBJS= locore.o ${OBJS} ioconf.o config.o hack.So
 SYSTEM_LD= @${LD} -Bdynamic -T $S/platform/$P/conf/ldscript.$M \
 	-export-dynamic -dynamic-linker /red/herring \
 	-o ${.TARGET} -X ${SYSTEM_OBJS} vers.o
+.if ${P} == "pc64"
+# XXX swildner: Workaround to make kernels linked with binutils220 boot.
+#
+SYSTEM_LD+= -z max-page-size=1048576
+.endif
 SYSTEM_LD_TAIL= @${OBJCOPY} --strip-symbol gcc2_compiled. ${.TARGET} ; \
 	${SIZE} ${.TARGET} ; chmod 755 ${.TARGET}
 SYSTEM_DEP+= $S/platform/$P/conf/ldscript.$M
